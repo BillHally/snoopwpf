@@ -10,6 +10,7 @@
 
 using namespace ManagedInjector;
 
+System::Reflection::Assembly ^ OnAssemblyResolve(System::Object ^sender, System::ResolveEventArgs ^args);
 static unsigned int WM_GOBABYGO = ::RegisterWindowMessage(L"Injector_GOBABYGO!");
 static HHOOK _messageHookHandle;
 
@@ -87,6 +88,91 @@ void Injector::LogMessage(System::String^ message, bool append)
 	sw->Close();
 }
 
+value struct AssemblyBindingRedirect
+{
+    System::String^ Name;
+    System::String^ MinVersion;
+    System::String^ MaxVersion;
+    System::String^ NewVersion;
+
+};
+
+System::Collections::Generic::List<AssemblyBindingRedirect>^ GetAssemblyBindingRedirects(System::String^ assemblyPath)
+{
+    auto configFilePath = System::String::Format("{0}.config", assemblyPath);
+    auto xml = gcnew System::Xml::XmlDocument();
+    xml->Load(configFilePath);
+    auto assemblyNodes = xml->GetElementsByTagName("dependentAssembly");
+
+    System::Collections::Generic::List<AssemblyBindingRedirect>^ bindingRedirects = gcnew System::Collections::Generic::List<AssemblyBindingRedirect>();
+
+    for each (System::Xml::XmlElement^ assemblyNode in assemblyNodes)
+    {
+        auto assemblyName = assemblyNode->GetElementsByTagName("assemblyIdentity")->Item(0)->Attributes->GetNamedItem("name")->Value;
+        auto bindingRedirectAttributes = assemblyNode->GetElementsByTagName("bindingRedirect")->Item(0)->Attributes;
+        
+        auto oldVersion = bindingRedirectAttributes->GetNamedItem("oldVersion")->Value;
+        auto minAndMax = oldVersion->Split('-');
+        auto minVersion = minAndMax[0];
+        auto maxVersion = minAndMax[1];
+        auto newVersion = bindingRedirectAttributes->GetNamedItem("newVersion")->Value;
+
+        auto redirect = AssemblyBindingRedirect();
+        redirect.Name = assemblyName;
+        redirect.MinVersion = minVersion;
+        redirect.MaxVersion = maxVersion;
+        redirect.NewVersion = newVersion;
+
+        bindingRedirects->Add(redirect);
+    }
+
+    return bindingRedirects;
+}
+
+ref class AssemblyBindingRedirector
+{
+private:
+    System::Collections::Generic::List<AssemblyBindingRedirect>^ bindingRedirects = nullptr;
+    System::String^ assemblyPath = nullptr;
+
+public:
+    AssemblyBindingRedirector(System::String^ assemblyPath)
+    {
+        bindingRedirects = GetAssemblyBindingRedirects(assemblyPath);
+        this->assemblyPath = assemblyPath;
+
+        // TODO: Move this?
+        System::AppDomain::CurrentDomain->AssemblyResolve += gcnew System::ResolveEventHandler(this, &AssemblyBindingRedirector::OnAssemblyResolve);
+    }
+
+    System::Reflection::Assembly^ OnAssemblyResolve(System::Object ^sender, System::ResolveEventArgs ^args)
+    {
+        for each (auto bindingRedirect in bindingRedirects)
+        {
+            if (bindingRedirect.Name->Equals(args->Name))
+            {
+                auto loadedFromAssemblyFolder = System::Reflection::Assembly::LoadFrom(System::IO::Path::GetDirectoryName(assemblyPath));
+
+                if (loadedFromAssemblyFolder != nullptr)
+                {
+                    return loadedFromAssemblyFolder;
+                }
+
+                auto loadedFromGac = System::Reflection::Assembly::LoadWithPartialName(args->Name);
+
+                if (loadedFromGac != nullptr)
+                {
+                    return loadedFromGac;
+                }
+
+                return nullptr;
+            }
+        }
+
+        return nullptr;
+    }
+};
+
 __declspec(dllexport) 
 LRESULT __stdcall MessageHookProc(int nCode, WPARAM wparam, LPARAM lparam)
 {
@@ -96,34 +182,45 @@ LRESULT __stdcall MessageHookProc(int nCode, WPARAM wparam, LPARAM lparam)
 		if (msg != NULL && msg->message == WM_GOBABYGO)
 		{
 			System::Diagnostics::Debug::WriteLine("Got WM_GOBABYGO message");
-
+            System::Diagnostics::Debugger::Break();
 			wchar_t* acmRemote = (wchar_t*)msg->wParam;
 
 			String^ acmLocal = gcnew System::String(acmRemote);
 			System::Diagnostics::Debug::WriteLine(System::String::Format("acmLocal = {0}", acmLocal));
 			cli::array<System::String^>^ acmSplit = acmLocal->Split('$');
 
-			System::Diagnostics::Debug::WriteLine(String::Format("About to load assembly {0}", acmSplit[0]));
-			System::Reflection::Assembly^ assembly = System::Reflection::Assembly::LoadFile(acmSplit[0]);
+            auto assemblyPath = acmSplit[0];
+            auto typeName     = acmSplit[1];
+            auto methodName   = acmSplit[2];
+            
+            System::Diagnostics::Debug::WriteLine(String::Format("About to load assembly {0}", assemblyPath));
+			System::Reflection::Assembly^ assembly = System::Reflection::Assembly::LoadFrom(assemblyPath);
 			if (assembly != nullptr)
 			{
-				System::Diagnostics::Debug::WriteLine(String::Format("About to load type {0}", acmSplit[1]));
-				System::Type^ type = assembly->GetType(acmSplit[1]);
+				System::Diagnostics::Debug::WriteLine(String::Format("About to load type {0}", typeName));
+				System::Type^ type = assembly->GetType(typeName);
 				if (type != nullptr)
 				{
-					System::Diagnostics::Debug::WriteLine(String::Format("Just loaded the type {0}", acmSplit[1]));
-					System::Reflection::MethodInfo^ methodInfo = type->GetMethod(acmSplit[2], System::Reflection::BindingFlags::Static | System::Reflection::BindingFlags::Public);
+					System::Diagnostics::Debug::WriteLine(String::Format("Just loaded the type {0}", typeName));
+					System::Reflection::MethodInfo^ methodInfo = type->GetMethod(methodName, System::Reflection::BindingFlags::Static | System::Reflection::BindingFlags::Public);
 					if (methodInfo != nullptr)
 					{
-						System::Diagnostics::Debug::WriteLine(System::String::Format("About to invoke {0} on type {1}", methodInfo->Name, acmSplit[1]));
+						System::Diagnostics::Debug::WriteLine(System::String::Format("About to invoke {0} on type {1}", methodInfo->Name, typeName));
+
+                        // If we've got this far we're almost ready to invoke the method - but if the assembly (whether dll or exe) we're injecting has
+                        // binding redirects in its .config, they won't apply here (since this function runs inside the target process), so we'll need to
+                        // load it ourselves, and perform any redirection that's required ourselves
+                        auto _ = gcnew AssemblyBindingRedirector(assemblyPath);
+
 						Object ^ returnValue = methodInfo->Invoke(nullptr, nullptr);
 						if (nullptr == returnValue)
 							returnValue = "NULL";
-						System::Diagnostics::Debug::WriteLine(String::Format("Return value of {0} on type {1} is {2}", methodInfo->Name, acmSplit[1], returnValue));
+						System::Diagnostics::Debug::WriteLine(String::Format("Return value of {0} on type {1} is {2}", methodInfo->Name, typeName, returnValue));
 					}
 				}
 			}
 		}
 	}
-	return CallNextHookEx(_messageHookHandle, nCode, wparam, lparam);
+
+    return CallNextHookEx(_messageHookHandle, nCode, wparam, lparam);
 }
